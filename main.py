@@ -129,7 +129,8 @@ def list_available_cities() -> str:
 def search_flights(origin: str = "", destination: str = "", cabin_class: str = "",
                    max_price_usd: float = 9999, min_rating: float = 0,
                    airline: str = "", sort_by: str = "price",
-                   sort_order: str = "asc") -> str:
+                   sort_order: str = "asc",
+                   include_return: bool = False) -> str:
     """Search flights across any supported origin and destination.
 
     'Dubai' widens to the UAE group (Dubai + Abu Dhabi + Sharjah + Ras Al
@@ -144,6 +145,9 @@ def search_flights(origin: str = "", destination: str = "", cabin_class: str = "
         airline: optional airline filter.
         sort_by: 'price' | 'rating' | 'departure'.
         sort_order: 'asc' (default) or 'desc'.
+        include_return: when True, ALSO searches the reverse direction and
+            appends the top 3 return options. Use this whenever the user asks
+            for a one-way flight — a real travel agent always offers the return.
     """
     if not origin and not destination:
         return ("ASK_USER: Ask the client exactly this and nothing else: "
@@ -213,7 +217,9 @@ def search_flights(origin: str = "", destination: str = "", cabin_class: str = "
         for i, (f, cls, cd) in enumerate(results[:15], 1):
             lines.append(fmt(i, f, cls, cd))
         _append_flight_selection_marker(lines, results)
-        return "\n".join(lines)
+        return _attach_return_recommendation(
+            "\n".join(lines), origin, destination, origin_cities, dest_cities,
+            cabin_class, max_price_usd, include_return)
 
     # ── price-sorted, headline + breakdown ────────────────────────────────
     if sort_by == "price":
@@ -254,7 +260,9 @@ def search_flights(origin: str = "", destination: str = "", cabin_class: str = "
 
         lines.append(f"\nTotal combinations: {len(combos)}")
         _append_flight_selection_marker(lines, combos)
-        return "\n".join(lines)
+        return _attach_return_recommendation(
+            "\n".join(lines), origin, destination, origin_cities, dest_cities,
+            cabin_class, max_price_usd, include_return)
 
     # ── grouped by class (rating/departure sort) ──────────────────────────
     by_class = {"Economy": [], "Premium Economy": [], "Business": [], "First": []}
@@ -283,8 +291,68 @@ def search_flights(origin: str = "", destination: str = "", cabin_class: str = "
     lines.append(f"\nTotal combinations: {total}")
     all_e = [e for es in by_class.values() for e in es]
     _append_flight_selection_marker(lines, all_e)
-    return "\n".join(lines)
+    return _attach_return_recommendation(
+        "\n".join(lines), origin, destination, origin_cities, dest_cities,
+        cabin_class, max_price_usd, include_return)
 
+
+def _attach_return_recommendation(body: str, origin: str, destination: str,
+                                   origin_cities: list, dest_cities: list,
+                                   cabin_class: str, max_price_usd: float,
+                                   include_return: bool) -> str:
+    """Append up to 3 recommended return flights.
+
+    Works for both exact cities and widened regions. When the destination
+    widened (e.g. 'Dubai' → all UAE cities), we still search returns from
+    ANY of those cities back to the origin. Return flights from Dubai,
+    Abu Dhabi, Sharjah, or Ras Al Khaimah back to Delhi are all valid
+    suggestions for the user.
+    """
+    if not include_return or not origin or not destination:
+        return body
+
+    flights = load_db().get("flights", [])
+    rev = []
+    for f in flights:
+        # Flight departs from any of the destination cities/region
+        if not any(d.lower() in f["origin"].lower() for d in dest_cities):
+            continue
+        # Flight arrives in any of the origin cities/region
+        if not any(o.lower() in f["destination"].lower() for o in origin_cities):
+            continue
+        for cls, cd in f.get("cabin_classes", {}).items():
+            if cabin_class and cabin_class.lower() not in cls.lower():
+                continue
+            if cd["price_usd"] > max_price_usd:
+                continue
+            rev.append((f, cls, cd))
+
+    if not rev:
+        return body
+
+    rev.sort(key=lambda x: x[2]["price_usd"])
+
+    # Describe the return route accurately — if the destination widened,
+    # say so instead of pretending it's only Dubai.
+    if len(dest_cities) == 1:
+        route_label = f"{dest_cities[0]} → {origin}"
+    else:
+        route_label = f"UAE cities ({', '.join(dest_cities)}) → {origin}"
+
+    lines = [body, "",
+             f"--- RECOMMENDED RETURN OPTIONS ({route_label}, cheapest first) ---"]
+    for i, (f, cls, cd) in enumerate(rev[:3], 1):
+        lines.append(
+            f"{i}. [{f['id']}] {f['airline']} {f['flight_no']} | "
+            f"{f['origin']} -> {f['destination']} | {cls} | "
+            f"dep {f['departure']} arr {f['arrival']} | {f['stops']} | "
+            f"${cd['price_usd']} (INR {cd['price_inr']}) | "
+            f"bag {cd['baggage']} | meal {cd['meal']} | rating {f['rating']}"
+        )
+    lines.append("")
+    lines.append("Present these to the user as suggested return options. "
+                 "Ask if they want a full round-trip plan.")
+    return "\n".join(lines)
 
 @tool
 def search_hotels(city: str = "", star_rating: int = 0, min_star_rating: int = 0,
@@ -868,6 +936,25 @@ REGION WIDENING
 'Dubai' searches the wider UAE (Dubai + Abu Dhabi + Sharjah + Ras Al Khaimah). \
 Always show each result's ACTUAL city — never relabel an Abu Dhabi hotel as Dubai.
 
+PROACTIVE RETURN FLIGHTS
+When the user asks for flights in ONE direction (e.g. "flights Delhi to Dubai",
+"show me flights to Dubai"), you MUST call search_flights with
+include_return=True. This appends a "RECOMMENDED RETURN OPTIONS" section to
+the tool output.
+
+Present both sections to the user in ONE reply:
+  1. ✈️ Outbound — the outbound flights
+  2. 🔄 Recommended return — the return options from the tool
+
+End with: "Want me to build a full round-trip plan?"
+
+A real travel agent always offers the return. Never leave it for the user to ask.
+
+Do NOT set include_return=True if:
+  - The user already asked for a round trip (you'll build it explicitly)
+  - The user is comparing "cheapest vs most expensive" on one direction only
+  - The origin or destination is a whole region like "UAE" or "India"
+
 "BOOK" MEANS REMEMBER
 "Book this one" = remember the exact flight for a later trip plan. No money is \
 charged. Acknowledge briefly; the code stores the flight ID and cabin.
@@ -938,10 +1025,14 @@ class TravelState(TypedDict, total=False):
     travelers: int
     selection_just_saved: bool
     trip_plan_requested: bool
-    comparison_requested: bool
     needs_origin: bool
     needs_destination: bool
     validator_state: str
+    preferred_cabin: str
+    dietary: str
+    hotel_type: str
+    user_name: str
+    force_return_recommendation: bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1122,6 +1213,7 @@ def _extract_travelers(text):
         return 2
     if "with my family" in t:
         return 4
+        
     return None
 
 
@@ -1327,11 +1419,7 @@ def preprocess_node(state: TravelState):
                 updates["selected_outbound_cabin_class"] = cand["cabin_class"]
             updates["selection_just_saved"] = True
 
-    # ── 5. Comparison queries are handled by the LLM, not by code ────────
-    # (Removed deterministic comparison to avoid false triggers when a user
-    #  mentions two different routes in one query.)
-    updates["comparison_requested"] = False
-
+    
     # ── 6. Missing info detection ─────────────────────────────────────────
     wants_flight = any(k in t_lower for k in
                        ("flight", "flights", "fly", "flying", "ticket", "tickets"))
@@ -1341,6 +1429,19 @@ def preprocess_node(state: TravelState):
                            ("attraction", "attractions", "things to do",
                             "sightseeing", "places to see", "places to visit"))
     wants_plan = updates.get("trip_plan_requested", False)
+
+    # ── Force return recommendation when user asks one-way ───────────────
+    # If the user asked for flights but did NOT mention round trip / return /
+    # comparison, force include_return=True so the agent always offers a
+    # return leg.
+    one_way_query = (
+        wants_flight
+        and not any(k in t_lower for k in ("round trip", "return", "coming back",
+                                            "back to", "returning", "two way",
+                                            "two-way"))
+        and not any(k in t_lower for k in ("vs", "versus", "compare", "comparison"))
+    )
+    updates["force_return_recommendation"] = one_way_query
 
     cur_origin = (updates.get("origin") or state.get("origin") or "").strip()
     cur_dest = (updates.get("destination") or state.get("destination") or "").strip()
@@ -1362,6 +1463,32 @@ def preprocess_node(state: TravelState):
 
     updates["needs_origin"] = needs_origin
     updates["needs_destination"] = needs_destination
+
+    # ── Session preferences ───────────────────────────────────────────────
+    if "first class" in t_lower or "first-class" in t_lower:
+        updates["preferred_cabin"] = "First"
+    elif "business class" in t_lower or "business-class" in t_lower:
+        updates["preferred_cabin"] = "Business"
+    elif "premium economy" in t_lower:
+        updates["preferred_cabin"] = "Premium Economy"
+    elif "economy class" in t_lower or "economy-class" in t_lower:
+        updates["preferred_cabin"] = "Economy"
+
+    if any(k in t_lower for k in ("vegetarian", "veg only", "no meat", "shudh veg")):
+        updates["dietary"] = "Vegetarian"
+    elif any(k in t_lower for k in ("non-vegetarian", "non vegetarian", "chicken", "mutton")):
+        updates["dietary"] = "Non-veg"
+
+    if any(k in t_lower for k in ("luxury hotel", "5 star hotel", "5-star hotel", "premium hotel")):
+        updates["hotel_type"] = "luxury"
+    elif any(k in t_lower for k in ("budget hotel", "cheap hotel", "hostel")):
+        updates["hotel_type"] = "budget"
+
+    m = re.search(r"\bmy name is\s+([a-z]+)\b", t_lower)
+    if m:
+        name = m.group(1).capitalize()
+        if name.lower() not in {"going", "planning", "looking", "flying"}:
+            updates["user_name"] = name
 
     return updates
 
@@ -1423,11 +1550,15 @@ def direct_trip_plan_node(state: TravelState):
     kwargs = {
         "origin": origin, "destination": destination,
         "duration_days": state.get("duration_days", 5),
-        "budget_level": state.get("budget_level", "midrange"),
+        "budget_level": (state.get("budget_level")
+                         or state.get("hotel_type")
+                         or "midrange"),
         "flight_preference": state.get("flight_preference", "cheapest"),
         "travelers": state.get("travelers", 1),
         "interests": state.get("interests", "sightseeing, culture, local food"),
-        "cabin_class": state.get("selected_outbound_cabin_class") or "Economy",
+        "cabin_class": (state.get("selected_outbound_cabin_class")
+                        or state.get("preferred_cabin")
+                        or "Economy"),
         "round_trip": True,
         "outbound_flight_id": state.get("selected_outbound_flight_id", ""),
         "outbound_cabin_class": state.get("selected_outbound_cabin_class", ""),
@@ -1435,29 +1566,10 @@ def direct_trip_plan_node(state: TravelState):
         "return_cabin_class": state.get("selected_return_cabin_class", ""),
         "return_destination": state.get("return_destination", ""),
     }
+
     result = build_trip_plan.invoke(kwargs)
     return {"trip_plan_requested": False,
             "messages": [AIMessage(content=result)]}
-
-
-def _memory_hint(state: TravelState) -> str:
-    return "\n".join([
-        "SESSION MEMORY (do not re-ask these):",
-        f"  origin          = {state.get('origin') or '[unset]'}",
-        f"  destination     = {state.get('destination') or '[unset]'}",
-        f"  return city     = {state.get('return_destination') or '[= origin]'}",
-        f"  travelers       = {state.get('travelers', '[unset]')}",
-        f"  duration_days   = {state.get('duration_days', '[unset]')}",
-        f"  budget_level    = {state.get('budget_level', '[unset]')}",
-        f"  flight_pref     = {state.get('flight_preference', '[unset]')}",
-        f"  outbound flight = {state.get('selected_outbound_flight_id') or '[none]'}"
-        + (f" ({state.get('selected_outbound_cabin_class')})"
-           if state.get("selected_outbound_cabin_class") else ""),
-        f"  return flight   = {state.get('selected_return_flight_id') or '[none]'}"
-        + (f" ({state.get('selected_return_cabin_class')})"
-           if state.get("selected_return_cabin_class") else ""),
-    ])
-
 
 def agent_node(state: TravelState):
     """Calls the LLM with system prompt + memory hint + full conversation."""
@@ -1491,6 +1603,13 @@ def tools_node(state: TravelState):
         name = tc["name"] if isinstance(tc, dict) else tc.name
         args = tc["args"] if isinstance(tc, dict) else tc.args
         call_id = tc["id"] if isinstance(tc, dict) else tc.id
+
+        # ── Auto-inject include_return for one-way flight searches ────────
+        if (name == "search_flights"
+                and state.get("force_return_recommendation")
+                and isinstance(args, dict)
+                and "include_return" not in args):
+            args = {**args, "include_return": True}
 
         fn = tool_map.get(name)
         if not fn:
@@ -1534,6 +1653,22 @@ def tools_node(state: TravelState):
 RETRY_MARKER = "[[VALIDATOR_RETRY]]"
 MAX_RETRIES = 2
 
+def _memory_hint(state: TravelState) -> str:
+    return "\n".join([
+        "SESSION MEMORY (do not re-ask these):",
+        f"  user_name       = {state.get('user_name') or '[unset]'}",
+        f"  origin          = {state.get('origin') or '[unset]'}",
+        f"  destination     = {state.get('destination') or '[unset]'}",
+        f"  travelers       = {state.get('travelers', '[unset]')}",
+        f"  duration_days   = {state.get('duration_days', '[unset]')}",
+        f"  budget_level    = {state.get('budget_level', '[unset]')}",
+        f"  preferred_cabin = {state.get('preferred_cabin') or '[unset]'}",
+        f"  dietary         = {state.get('dietary') or '[unset]'}",
+        f"  hotel_type      = {state.get('hotel_type') or '[unset]'}",
+        "",
+        "Honor these in every reply. Never re-ask what is already set.",
+    ])
+
 def _extract_facts(text: str):
     """Pull out DB-verifiable facts: flight numbers and prices.
     Returns (flight_numbers, set_of_price_integers)."""
@@ -1554,27 +1689,6 @@ def _extract_facts(text: str):
         except ValueError:
             pass
     return flight_numbers, prices
-
-
-def _has_cjk(text: str) -> bool:
-    """True if text contains Chinese / Japanese / Korean characters."""
-    if not text:
-        return False
-    return any(
-        "\u4e00" <= ch <= "\u9fff"      # CJK Unified Ideographs
-        or "\u3040" <= ch <= "\u30ff"   # Hiragana / Katakana
-        or "\uac00" <= ch <= "\ud7af"   # Hangul
-        for ch in text
-    )
-
-
-def _last_human_was_english(messages) -> bool:
-    """Check whether the user's most recent message was written in English."""
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            return not _has_cjk(m.content or "")
-    return True
-
 
 def _count_retries(messages):
     count = 0
@@ -1738,8 +1852,13 @@ def coverage_check_node(state: TravelState):
             if tool_name == "search_flights":
                 if not origin or not destination:
                     continue
+                # Define args BEFORE using it
                 args = {"origin": origin, "destination": destination,
                         "cabin_class": "", "sort_by": "price", "sort_order": "asc"}
+                # Respect the one-way detection so the forced call also
+                # returns recommended return options.
+                if state.get("force_return_recommendation"):
+                    args["include_return"] = True
                 result = search_flights.invoke(args)
             elif tool_name == "search_hotels":
                 if not destination:
@@ -1913,3 +2032,5 @@ if __name__ == "__main__":
         else:
             print(f"\nAgent: [no reply — try rephrasing]\n")
         print("-" * 60)
+
+
