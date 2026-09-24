@@ -1,0 +1,24 @@
+cat > .gitignore <<'EOF'
+# Secrets — NEVER commit
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optional: don't commit travel.db (regenerated from db.json)
+travel.db
+EOF
