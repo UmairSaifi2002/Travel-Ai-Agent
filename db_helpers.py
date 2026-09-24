@@ -140,7 +140,3 @@ def log_search_to_db(user_id: str, search_entry: str):
     )
     conn.commit()
     conn.close()
-
-
-
-    
