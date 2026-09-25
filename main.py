@@ -1,5 +1,5 @@
 """
-main.py — Travel Agent (v10, full rebuild)
+main.py — Travel Agent (v11, conversational trip planner)
 
 Zero-hallucination, database-backed travel agent.
 
@@ -8,6 +8,7 @@ Key design principles:
   * When LLM behavior is unreliable, do it in code (trip plans, comparisons).
   * Missing info is caught in preprocess_node — the LLM never sees it.
   * A validator blocks any reply containing a fact not in tool output.
+  * Trip plans use conversational slot-filling with defaults.
 """
 import os
 import sys
@@ -304,9 +305,7 @@ def _attach_return_recommendation(body: str, origin: str, destination: str,
 
     Works for both exact cities and widened regions. When the destination
     widened (e.g. 'Dubai' → all UAE cities), we still search returns from
-    ANY of those cities back to the origin. Return flights from Dubai,
-    Abu Dhabi, Sharjah, or Ras Al Khaimah back to Delhi are all valid
-    suggestions for the user.
+    ANY of those cities back to the origin.
     """
     if not include_return or not origin or not destination:
         return body
@@ -314,10 +313,8 @@ def _attach_return_recommendation(body: str, origin: str, destination: str,
     flights = load_db().get("flights", [])
     rev = []
     for f in flights:
-        # Flight departs from any of the destination cities/region
         if not any(d.lower() in f["origin"].lower() for d in dest_cities):
             continue
-        # Flight arrives in any of the origin cities/region
         if not any(o.lower() in f["destination"].lower() for o in origin_cities):
             continue
         for cls, cd in f.get("cabin_classes", {}).items():
@@ -332,8 +329,6 @@ def _attach_return_recommendation(body: str, origin: str, destination: str,
 
     rev.sort(key=lambda x: x[2]["price_usd"])
 
-    # Describe the return route accurately — if the destination widened,
-    # say so instead of pretending it's only Dubai.
     if len(dest_cities) == 1:
         route_label = f"{dest_cities[0]} → {origin}"
     else:
@@ -353,6 +348,7 @@ def _attach_return_recommendation(body: str, origin: str, destination: str,
     lines.append("Present these to the user as suggested return options. "
                  "Ask if they want a full round-trip plan.")
     return "\n".join(lines)
+
 
 @tool
 def search_hotels(city: str = "", star_rating: int = 0, min_star_rating: int = 0,
@@ -959,11 +955,28 @@ Do NOT set include_return=True if:
 "Book this one" = remember the exact flight for a later trip plan. No money is \
 charged. Acknowledge briefly; the code stores the flight ID and cabin.
 
-TRIP PLAN
+TRIP PLAN — CONVERSATIONAL FLOW (handled by code, not by you)
+When the user asks for a trip plan (e.g. "plan a trip to Dubai",
+"create a 5-day trip", "make a trip plan"), the code takes over and asks
+for missing required slots ONE AT A TIME — origin, destination, duration,
+travelers. You don't need to ask these yourself.
+
+If the user says something like "just build it", "use defaults", "you decide",
+"doesn't matter", or "surprise me" while the code is asking questions, the
+code will fill the remaining optional slots with defaults (5 days, 1 traveler,
+midrange budget, Economy) and build the plan.
+
+Once the plan is built, the user may ask for a refinement:
+  - "make it luxury"          → rebuild with budget_level="luxury"
+  - "change to 7 days"        → rebuild with duration_days=7
+  - "make it business class"  → rebuild with cabin_class="Business"
+When they ask for a refinement, call build_trip_plan again with the updated
+params. Keep origin/destination/duration/travelers the same unless they
+explicitly change one.
+
 Pass confirmed flight IDs to build_trip_plan as outbound_flight_id / \
 return_flight_id. For open-jaw trips (out via A, back to B where B != A), pass \
-return_destination=B. Do not ask for budget/duration/cabin before building — \
-use defaults and let the client refine.
+return_destination=B.
 
 FORMAT
 - If asked for "non-stop" / "direct", only show flights where stops = Non-Stop. \
@@ -979,8 +992,6 @@ class has zero results, print "No <Class> options on this route."
 CITIES
 If unsure whether a city is supported, call list_available_cities.
 
-ROUND TRIPS — EXACT PATTERN TO FOLLOW
-
 COMPARISON QUERIES
 When the user asks for a comparison (e.g. "cheapest vs most expensive",
 "compare X and Y", "what's the price range"):
@@ -991,13 +1002,9 @@ When the user asks for a comparison (e.g. "cheapest vs most expensive",
       Call 2: sort_by="price", sort_order="desc"  (most expensive first)
     Then show both extremes side by side in your reply.
 
-  For MULTIPLE routes in one query (e.g. "most expensive Dubai to Delhi
-  AND cheapest Pune to Dubai"):
+  For MULTIPLE routes in one query:
     Treat this as TWO SEPARATE searches. Call search_flights once for each
-    route with the correct sort order:
-      Call 1: origin="Dubai", destination="Delhi", sort_order="desc"
-      Call 2: origin="Pune", destination="Dubai", sort_order="asc"
-    Present the results as two clearly-labelled sections.
+    route with the correct sort order.
 
   Never say "only one option exists" unless the tool result literally says so.
   Every price you quote must be in a tool result.
@@ -1033,6 +1040,9 @@ class TravelState(TypedDict, total=False):
     hotel_type: str
     user_name: str
     force_return_recommendation: bool
+    pending_trip_plan: bool
+    use_defaults_for_remaining: bool
+    trip_plan_cancelled: bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1072,14 +1082,7 @@ def _supported_cities():
 
 
 def _extract_city_pair(text: str):
-    """Extract origin/destination from free text.
-
-    Handles:
-      - English:  "from Delhi to Dubai", "Delhi to Dubai"
-      - Hinglish: "Delhi se Dubai", "Delhi sy Dubai", "Delhi se lekar Dubai"
-      - Reverse:  "go to Dubai from Delhi"
-      - Fallback: exactly two supported cities mentioned → first=origin, second=dest
-    """
+    """Extract origin/destination from free text."""
     if not text:
         return None, None
     cities = _supported_cities()
@@ -1100,7 +1103,6 @@ def _extract_city_pair(text: str):
         if m:
             return m.group("o"), m.group("d")
 
-    # Fallback: exactly two supported cities → first is origin, second is dest
     found = []
     for c in cities:
         if re.search(rf"\b{re.escape(c)}\b", text, re.IGNORECASE):
@@ -1130,15 +1132,12 @@ def _extract_single_city(text: str):
     city = found[0]
     esc = re.escape(city.lower())
 
-    # Origin markers
     if (re.search(rf"\bfrom\s+{esc}\b", t)
             or re.search(rf"\b{esc}\s+(?:se|sy|sé)\b", t)):
         return city, None
 
-    # Destination markers
-    # Destination markers
     if (re.search(rf"\bto\s+{esc}\b", t)
-            or re.search(rf"\bin\s+{esc}\b", t)          # ⭐ "in Dubai"
+            or re.search(rf"\bin\s+{esc}\b", t)
             or re.search(rf"\b{esc}\s+(?:jaana|jana|chahiye|chaiye)\b", t)):
         return None, city
 
@@ -1146,8 +1145,7 @@ def _extract_single_city(text: str):
 
 
 def _find_bare_city(text: str):
-    """Return the single supported city mentioned, ignoring context markers.
-    Used when the user replies to 'which city?' with just a city name."""
+    """Return the single supported city mentioned, ignoring context markers."""
     if not text:
         return None
     cities = _supported_cities()
@@ -1158,6 +1156,7 @@ def _find_bare_city(text: str):
             if c.lower() not in [f.lower() for f in found]:
                 found.append(c)
     return found[0] if len(found) == 1 else None
+
 
 def _extract_duration(text):
     m = re.search(r"\b(\d{1,2})\s*(?:days?|nights?)\b", text.lower())
@@ -1178,42 +1177,78 @@ def _extract_budget(text):
 
 
 def _extract_travelers(text):
-    t = text.lower()
+    """Robust traveler count extraction.
 
-    # ⭐ "me and my 4 friends" / "I and my 3 friends" → N + 1
-    m = re.search(r"\b(?:me|i)\s+(?:and|plus|\+)\s+(?:my\s+|our\s+)?(\d+)\s+"
-                  r"(?:friends|people|persons|passengers|travelers|travellers)\b", t)
+    Handles bare answers ("2", "two"), companion phrases ("me and my wife"),
+    group phrases ("me and my 4 friends"), and family/couple cues.
+    """
+    if not text:
+        return None
+    t = text.lower().strip()
+
+    # ── Fast paths for bare answers ───────────────────────────────────────
+    m = re.fullmatch(r"(\d{1,2})", t)
     if m:
-        return max(1, int(m.group(1)) + 1)
-
-    # ⭐ "4 friends and me" / "3 friends and I" → N + 1
-    m = re.search(r"\b(\d+)\s+(?:friends|people|persons|passengers|travelers|travellers)\s+"
-                  r"(?:and|plus|\+)\s+(?:me|i)\b", t)
-    if m:
-        return max(1, int(m.group(1)) + 1)
-
-    # "we are 5" / "there are 5 of us"
-    m = re.search(r"\b(?:we\s+are|there\s+are)\s+(\d+)\s+(?:of\s+us|friends|people)\b", t)
+        return max(1, int(m.group(1)))
+    m = re.fullmatch(r"(\d{1,2})\s+(?:people|persons|passengers|travelers|travellers|pax)", t)
     if m:
         return max(1, int(m.group(1)))
 
-    # "5 friends", "3 people", "family of 4"
-    m = re.search(r"\b(\d+)\s+(?:friends|people|persons|passengers|travelers|travellers)\b", t)
+    # Word numbers: "two", "three", ... "ten"
+    word_nums = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    m = re.fullmatch(r"(one|two|three|four|five|six|seven|eight|nine|ten)", t)
     if m:
-        return max(1, int(m.group(1)))
+        return word_nums[m.group(1)]
 
+    # ── Couple / wife / husband / partner → 2 ─────────────────────────────
+    couple_phrases = (
+        "me and my wife", "me and my husband", "me and my spouse",
+        "me and my partner", "me and my girlfriend", "me and my boyfriend",
+        "i and my wife", "i and my husband",
+        "myself and my wife", "myself and my husband",
+        "my wife and me", "my husband and me",
+        "my wife and i", "my husband and i",
+        "with my wife", "with my husband", "with my spouse",
+        "with my partner", "with my girlfriend", "with my boyfriend",
+        "wife and me", "husband and me", "wife and i", "husband and i",
+        "couple", "honeymoon", "just the two of us", "two of us", "both of us",
+    )
+    if any(p in t for p in couple_phrases):
+        return 2
+
+    # ── Family (no specific count) → assume 4 ─────────────────────────────
+    if "with my family" in t or "me and my family" in t:
+        return 4
     m = re.search(r"\bfamily\s+of\s+(\d+)\b", t)
     if m:
         return max(1, int(m.group(1)))
 
-    # "with my wife/husband/partner" implies 2
-    if any(x in t for x in ("with my wife", "with my husband", "with my spouse",
-                            "with my partner", "with my girlfriend",
-                            "with my boyfriend")):
-        return 2
-    if "with my family" in t:
-        return 4
-        
+    # ── "me and my N friends" / "N friends and me" → N + 1 ────────────────
+    m = re.search(
+        r"\b(?:me|i|myself)\s+(?:and|plus|\+)\s+(?:my\s+|our\s+)?(\d+)\s+"
+        r"(?:friends|people|persons|passengers|travelers|travellers|colleagues)\b", t
+    )
+    if m:
+        return max(1, int(m.group(1)) + 1)
+
+    m = re.search(
+        r"\b(\d+)\s+(?:friends|people|persons|passengers|travelers|travellers|colleagues)\s+"
+        r"(?:and|plus|\+)\s+(?:me|i|myself)\b", t
+    )
+    if m:
+        return max(1, int(m.group(1)) + 1)
+
+    # ── "we are N" / "there are N of us" ──────────────────────────────────
+    m = re.search(r"\b(?:we\s+are|there\s+are)\s+(\d+)\s+(?:of\s+us|friends|people)\b", t)
+    if m:
+        return max(1, int(m.group(1)))
+
+    # ── "N friends" / "N people" ──────────────────────────────────────────
+    m = re.search(r"\b(\d+)\s+(?:friends|people|persons|passengers|travelers|travellers)\b", t)
+    if m:
+        return max(1, int(m.group(1)))
+
     return None
 
 
@@ -1225,11 +1260,9 @@ def _looks_like_trip_plan(text):
     """Detect trip-plan intent from natural language, not just literal phrases."""
     t = text.lower()
 
-    # Literal phrases
     if any(p in t for p in TRIP_PLAN_PHRASES):
         return True
 
-    # "want to go", "wanna go", "planning to go", "would like to visit", etc.
     if any(p in t for p in (
         "want to go", "wanna go", "want to visit", "wanna visit",
         "want to travel", "wanna travel", "planning to go",
@@ -1238,13 +1271,11 @@ def _looks_like_trip_plan(text):
         "going to", "heading to", "trip to", "travel to",
         "jaana", "jana", "chahiye", "chaiye", "ghoomne",
     )):
-        # ...but only if a trip duration or planning context is present
         if (re.search(r"\b\d{1,2}\s*(?:days?|nights?)\b", t)
                 or "trip" in t or "travel" in t or "visit" in t
                 or "holiday" in t or "vacation" in t):
             return True
 
-    # "for 5 days" alone with a destination is often a trip-plan ask
     if re.search(r"\b\d{1,2}\s*(?:days?|nights?)\b", t) and "to " in t:
         return True
 
@@ -1283,7 +1314,8 @@ def _pick_flight(text, results):
 
 def preprocess_node(state: TravelState):
     """Runs before the LLM. Extracts facts, resolves 'book this one', detects
-    missing info so the LLM never sees it."""
+    missing info so the LLM never sees it. Also handles the conversational
+    trip-plan slot-filling flow."""
     msgs = state.get("messages", [])
     human = _last_human(msgs)
     if not human:
@@ -1292,19 +1324,58 @@ def preprocess_node(state: TravelState):
     text = human.content or ""
     t_lower = text.lower()
 
+    trip_plan_this_turn = _looks_like_trip_plan(text)
     updates: dict = {
         "selection_just_saved": False,
-        "trip_plan_requested": _looks_like_trip_plan(text),
+        "trip_plan_requested": trip_plan_this_turn,
+        "trip_plan_cancelled": False,   # reset every turn
     }
 
-    # ── 1. City extraction ────────────────────────────────────────────────
+    # ── Pending trip-plan flow ────────────────────────────────────────────
+    if trip_plan_this_turn:
+        updates["pending_trip_plan"] = True
+        updates["use_defaults_for_remaining"] = False
+
+    if state.get("pending_trip_plan"):
+        # Cancellation
+        if any(k in t_lower for k in ("cancel", "never mind", "nevermind",
+                                       "forget it", "abort")):
+            updates["pending_trip_plan"] = False
+            updates["trip_plan_requested"] = False
+            updates["use_defaults_for_remaining"] = False
+            updates["trip_plan_cancelled"] = True
+
+        # "Just build it" / "use defaults" detection
+        skip_phrases = (
+            "just build", "just make", "just create", "just do it",
+            "just plan it", "just plan", "just go ahead",
+            "use default", "use the default", "default settings",
+            "defaults are fine", "default is fine",
+            "you decide", "you choose", "you pick", "your choice",
+            "surprise me", "up to you",
+            "doesn't matter", "does not matter", "don't care",
+            "dont care", "no preference", "any is fine", "anything works",
+            "go ahead", "proceed", "skip",
+        )
+        if any(p in t_lower for p in skip_phrases):
+            updates["use_defaults_for_remaining"] = True
+
+        # Abandon if the user clearly switched to a different intent
+        other_intents = ("hotel", "hotels", "flight", "flights",
+                         "attraction", "attractions", "restaurant",
+                         "restaurants", "dining", "things to do")
+        if (len(t_lower.split()) > 3
+                and any(kw in t_lower for kw in other_intents)
+                and not _looks_like_trip_plan(text)):
+            updates["pending_trip_plan"] = False
+            updates["use_defaults_for_remaining"] = False
+
     # ── 1. City extraction ────────────────────────────────────────────────
     origin, destination = _extract_city_pair(text)
     if not origin and not destination:
         origin, destination = _extract_single_city(text)
 
-    # ⭐ Bare-city fallback: user replied to "which city?" with just a city
-    # name. Use context (which slot is missing) to classify it.
+    # Bare-city fallback: user replied to "which city?" with just a city
     if not origin and not destination:
         bare = _find_bare_city(text)
         if bare:
@@ -1315,11 +1386,9 @@ def preprocess_node(state: TravelState):
             elif not cur_d and cur_o:
                 destination = bare
             elif not cur_o and not cur_d:
-                # Nothing known yet — treat as origin (most common case)
                 origin = bare
 
-    # Normalize case: "delhi" → "Delhi", "abu dhabi" → "Abu Dhabi"
-        # Normalize case: "delhi" → "Delhi", "abu dhabi" → "Abu Dhabi"
+    # Normalize case
     def _norm(c):
         return " ".join(w.capitalize() for w in (c or "").strip().split())
 
@@ -1333,7 +1402,6 @@ def preprocess_node(state: TravelState):
         if not cur_o:
             updates["origin"] = new_origin
         elif new_origin.lower() != cur_o.lower():
-            # New origin → reset the whole trip
             updates.update({
                 "origin": new_origin,
                 "destination": "",
@@ -1349,7 +1417,6 @@ def preprocess_node(state: TravelState):
         if not cur_d:
             updates["destination"] = new_destination
         elif new_destination.lower() != cur_d.lower():
-            # New destination → replace it and reset return-leg / flight selections
             updates.update({
                 "destination": new_destination,
                 "return_destination": "",
@@ -1359,8 +1426,7 @@ def preprocess_node(state: TravelState):
                 "selected_return_cabin_class": "",
             })
 
-    # Both cities found — handled by the existing block below
-
+    # Both cities found
     if origin and destination:
         cur_o = (state.get("origin") or "").strip()
         cur_d = (state.get("destination") or "").strip()
@@ -1419,7 +1485,6 @@ def preprocess_node(state: TravelState):
                 updates["selected_outbound_cabin_class"] = cand["cabin_class"]
             updates["selection_just_saved"] = True
 
-    
     # ── 6. Missing info detection ─────────────────────────────────────────
     wants_flight = any(k in t_lower for k in
                        ("flight", "flights", "fly", "flying", "ticket", "tickets"))
@@ -1430,10 +1495,7 @@ def preprocess_node(state: TravelState):
                             "sightseeing", "places to see", "places to visit"))
     wants_plan = updates.get("trip_plan_requested", False)
 
-    # ── Force return recommendation when user asks one-way ───────────────
-    # If the user asked for flights but did NOT mention round trip / return /
-    # comparison, force include_return=True so the agent always offers a
-    # return leg.
+    # Force return recommendation when user asks one-way
     one_way_query = (
         wants_flight
         and not any(k in t_lower for k in ("round trip", "return", "coming back",
@@ -1449,17 +1511,19 @@ def preprocess_node(state: TravelState):
     needs_origin = False
     needs_destination = False
 
-    # A trip-plan request OR any flight-related ask requires an origin.
-    # This fires even when the user only said "I want to go to Dubai for 5 days"
-    # (no "flight" keyword) — because trip planning inherently needs an origin.
-    if wants_plan or wants_flight:
-        if not cur_origin:
-            needs_origin = True
-        elif not cur_dest:
-            needs_destination = True
-    elif wants_hotel or wants_attraction:
-        if not cur_dest:
-            needs_destination = True
+    # If a trip plan is pending, don't flag needs_origin/needs_destination here —
+    # the direct_trip_plan_node handles the slot-filling questions.
+    pending = updates.get("pending_trip_plan", state.get("pending_trip_plan", False))
+
+    if not pending:
+        if wants_plan or wants_flight:
+            if not cur_origin:
+                needs_origin = True
+            elif not cur_dest:
+                needs_destination = True
+        elif wants_hotel or wants_attraction:
+            if not cur_dest:
+                needs_destination = True
 
     updates["needs_origin"] = needs_origin
     updates["needs_destination"] = needs_destination
@@ -1491,6 +1555,18 @@ def preprocess_node(state: TravelState):
             updates["user_name"] = name
 
     return updates
+
+
+def trip_plan_cancelled_node(state: TravelState):
+    """Canned reply when the user cancels a trip-plan flow.
+    Bypasses the LLM entirely so 503s can't break the UX."""
+    return {
+        "trip_plan_cancelled": False,
+        "messages": [AIMessage(content=(
+            "No problem — trip planning cancelled. 👋\n\n"
+            "Let me know if you'd like to plan something else later!"
+        ))],
+    }
 
 
 def selection_ack_node(state: TravelState):
@@ -1536,25 +1612,89 @@ def ask_missing_info_node(state: TravelState):
         "messages": [AIMessage(content=q)],
     }
 
-def direct_trip_plan_node(state: TravelState):
-    """Build the plan and return it as the FINAL AIMessage — bypass the LLM
-    entirely so the plan text isn't reformatted, mangled, or truncated."""
-    origin = state.get("origin", "")
-    destination = state.get("destination", "")
-    if not origin or not destination:
-        return {"trip_plan_requested": False,
-                "messages": [AIMessage(content="I need both the origin and "
-                                               "destination before I can build "
-                                               "the plan.")]}
 
+def direct_trip_plan_node(state: TravelState):
+    """Conversational slot-filling trip planner.
+
+    Asks for missing required slots one at a time across turns. Honors
+    'use_defaults_for_remaining' — once the user says "just build it" or
+    "use defaults", missing optional slots are filled silently.
+
+    Slot priority order:
+      1. origin          (never defaulted — must be provided)
+      2. destination     (never defaulted — must be provided)
+      3. duration_days   (defaults to 5 if skipped)
+      4. travelers       (defaults to 1 if skipped)
+    """
+    origin = (state.get("origin") or "").strip()
+    destination = (state.get("destination") or "").strip()
+    duration = state.get("duration_days")
+    travelers = state.get("travelers")
+    use_defaults = state.get("use_defaults_for_remaining", False)
+
+    # ── Slot 1: origin — cannot be defaulted ─────────────────────────────
+    if not origin:
+        return {
+            "trip_plan_requested": False,
+            "pending_trip_plan": True,
+            "messages": [AIMessage(content=(
+                "Sure, I'll help you plan that trip! 🌍\n\n"
+                "**Which city are you flying from?**"
+            ))]
+        }
+
+    # ── Slot 2: destination — cannot be defaulted ────────────────────────
+    if not destination:
+        return {
+            "trip_plan_requested": False,
+            "pending_trip_plan": True,
+            "messages": [AIMessage(content=(
+                f"Great — flying from **{origin}**. ✈️\n\n"
+                f"**Where would you like to go?**"
+            ))]
+        }
+
+    # ── Slot 3: duration — ask unless user opted for defaults ────────────
+    if not duration:
+        if use_defaults:
+            duration = 5
+        else:
+            return {
+                "trip_plan_requested": False,
+                "pending_trip_plan": True,
+                "messages": [AIMessage(content=(
+                    f"Perfect — **{origin} → {destination}**. 📍\n\n"
+                    f"**How many days will you be staying?**\n\n"
+                    f"_(If you're not sure, just say \"use defaults\" "
+                    f"and I'll plan a 5-day trip.)_"
+                ))]
+            }
+
+    # ── Slot 4: travelers — ask unless user opted for defaults ───────────
+    if not travelers:
+        if use_defaults:
+            travelers = 1
+        else:
+            return {
+                "trip_plan_requested": False,
+                "pending_trip_plan": True,
+                "messages": [AIMessage(content=(
+                    f"Got it — **{duration}-day trip to {destination}**. 🗓️\n\n"
+                    f"**How many travelers will be going?**\n\n"
+                    f"_(Or just say \"use defaults\" for a solo trip.)_"
+                ))]
+            }
+
+    # ── All required slots filled — build the plan ───────────────────────
     kwargs = {
-        "origin": origin, "destination": destination,
-        "duration_days": state.get("duration_days", 5),
+        "origin": origin,
+        "destination": destination,
+        "duration_days": duration,
+        "travelers": travelers,
         "budget_level": (state.get("budget_level")
                          or state.get("hotel_type")
                          or "midrange"),
         "flight_preference": state.get("flight_preference", "cheapest"),
-        "travelers": state.get("travelers", 1),
         "interests": state.get("interests", "sightseeing, culture, local food"),
         "cabin_class": (state.get("selected_outbound_cabin_class")
                         or state.get("preferred_cabin")
@@ -1568,8 +1708,39 @@ def direct_trip_plan_node(state: TravelState):
     }
 
     result = build_trip_plan.invoke(kwargs)
-    return {"trip_plan_requested": False,
-            "messages": [AIMessage(content=result)]}
+
+    pax_label = f"{travelers} traveler{'s' if travelers != 1 else ''}"
+    header = (f"Here's your complete **{duration}-day trip to {destination}** "
+              f"for **{pax_label}**:\n\n")
+
+    if use_defaults:
+        header = ("Here's your trip plan (using sensible defaults for the "
+                  "details you skipped):\n\n") + header
+
+    return {
+        "trip_plan_requested": False,
+        "pending_trip_plan": False,
+        "use_defaults_for_remaining": False,
+        "messages": [AIMessage(content=header + result)],
+    }
+
+
+def _memory_hint(state: TravelState) -> str:
+    return "\n".join([
+        "SESSION MEMORY (do not re-ask these):",
+        f"  user_name       = {state.get('user_name') or '[unset]'}",
+        f"  origin          = {state.get('origin') or '[unset]'}",
+        f"  destination     = {state.get('destination') or '[unset]'}",
+        f"  travelers       = {state.get('travelers', '[unset]')}",
+        f"  duration_days   = {state.get('duration_days', '[unset]')}",
+        f"  budget_level    = {state.get('budget_level', '[unset]')}",
+        f"  preferred_cabin = {state.get('preferred_cabin') or '[unset]'}",
+        f"  dietary         = {state.get('dietary') or '[unset]'}",
+        f"  hotel_type      = {state.get('hotel_type') or '[unset]'}",
+        "",
+        "Honor these in every reply. Never re-ask what is already set.",
+    ])
+
 
 def agent_node(state: TravelState):
     """Calls the LLM with system prompt + memory hint + full conversation."""
@@ -1604,7 +1775,7 @@ def tools_node(state: TravelState):
         args = tc["args"] if isinstance(tc, dict) else tc.args
         call_id = tc["id"] if isinstance(tc, dict) else tc.id
 
-        # ── Auto-inject include_return for one-way flight searches ────────
+        # Auto-inject include_return for one-way flight searches
         if (name == "search_flights"
                 and state.get("force_return_recommendation")
                 and isinstance(args, dict)
@@ -1640,7 +1811,6 @@ def tools_node(state: TravelState):
             build_plan_result = clean
 
     if build_plan_result is not None:
-        # Trip plan is already perfectly formatted — send directly to user
         return {
             "messages": out_msgs + [AIMessage(content=build_plan_result)],
             "last_flight_results": new_results,
@@ -1653,21 +1823,6 @@ def tools_node(state: TravelState):
 RETRY_MARKER = "[[VALIDATOR_RETRY]]"
 MAX_RETRIES = 2
 
-def _memory_hint(state: TravelState) -> str:
-    return "\n".join([
-        "SESSION MEMORY (do not re-ask these):",
-        f"  user_name       = {state.get('user_name') or '[unset]'}",
-        f"  origin          = {state.get('origin') or '[unset]'}",
-        f"  destination     = {state.get('destination') or '[unset]'}",
-        f"  travelers       = {state.get('travelers', '[unset]')}",
-        f"  duration_days   = {state.get('duration_days', '[unset]')}",
-        f"  budget_level    = {state.get('budget_level', '[unset]')}",
-        f"  preferred_cabin = {state.get('preferred_cabin') or '[unset]'}",
-        f"  dietary         = {state.get('dietary') or '[unset]'}",
-        f"  hotel_type      = {state.get('hotel_type') or '[unset]'}",
-        "",
-        "Honor these in every reply. Never re-ask what is already set.",
-    ])
 
 def _extract_facts(text: str):
     """Pull out DB-verifiable facts: flight numbers and prices.
@@ -1676,19 +1831,18 @@ def _extract_facts(text: str):
         return [], set()
     flight_numbers = re.findall(r"\b[A-Z]{1,3}-\d{3,4}\b", text)
     prices = set()
-    # $1234, $1,234, ₹14691, ₹14,691
     for m in re.finditer(r"[$₹]\s?(\d[\d,]*)", text):
         try:
             prices.add(int(m.group(1).replace(",", "")))
         except ValueError:
             pass
-    # INR 14691, USD 246 (used in tool output formatting)
     for m in re.finditer(r"\b(?:INR|USD)\s?(\d[\d,]*)", text):
         try:
             prices.add(int(m.group(1).replace(",", "")))
         except ValueError:
             pass
     return flight_numbers, prices
+
 
 def _count_retries(messages):
     count = 0
@@ -1705,16 +1859,15 @@ def _has_cjk(text: str) -> bool:
     if not text:
         return False
     return any(
-        "\u4e00" <= ch <= "\u9fff"      # CJK Unified Ideographs
-        or "\u3040" <= ch <= "\u30ff"   # Hiragana / Katakana
-        or "\uac00" <= ch <= "\ud7af"   # Hangul
+        "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
         for ch in text
     )
 
 
 def _last_human_was_english(messages) -> bool:
-    """Check whether the user's most recent message was written in English
-    (i.e. contains no CJK characters)."""
+    """Check whether the user's most recent message was written in English."""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
             return not _has_cjk(m.content or "")
@@ -1728,8 +1881,6 @@ def validate_node(state: TravelState):
     reply = last.content or ""
 
     # ── 1. Language backstop ─────────────────────────────────────────────
-    # If the model replied in Chinese/Japanese/Korean but the user wrote in
-    # English, reject it and force an English retry.
     if _has_cjk(reply) and _last_human_was_english(state["messages"]):
         retries = _count_retries(state["messages"])
         if retries >= MAX_RETRIES:
@@ -1752,6 +1903,13 @@ def validate_node(state: TravelState):
     if (reply.startswith("=" * 10) or "TRIP PLAN —" in reply
             or "CHEAPEST vs MOST EXPENSIVE" in reply
             or reply.startswith("Saved outbound flight")
+            or reply.startswith("Sure, I'll help you plan")
+            or reply.startswith("Great — flying from")
+            or reply.startswith("Perfect — ")
+            or reply.startswith("Got it — ")
+            or reply.startswith("Here's your complete")
+            or reply.startswith("Here's your trip plan")
+            or reply.startswith("No problem — trip planning cancelled")
             or reply in ("Which city are you flying from?",
                          "Which city would you like to go to?",
                          "Could you tell me a bit more about your trip?")):
@@ -1764,7 +1922,6 @@ def validate_node(state: TravelState):
         return {"validator_state": "clean"}
 
     # ── 4. Fact check ────────────────────────────────────────────────────
-    # ── 4. Fact check (numeric comparison, currency-agnostic) ────────────
     reply_flights, reply_prices = _extract_facts(reply)
     tool_flights, tool_prices = _extract_facts(tool_outputs)
 
@@ -1794,6 +1951,7 @@ def validate_node(state: TravelState):
                 f"tool result: {', '.join(invented)}. Rewrite your answer using "
                 f"ONLY the data in the tool results above. Do not add any flight "
                 f"number, price, hotel name, or attraction that is not there."))]}
+
 
 # ── Coverage check (multi-part enforcement) ───────────────────────────────────
 INTENT_KEYWORDS = {
@@ -1852,11 +2010,8 @@ def coverage_check_node(state: TravelState):
             if tool_name == "search_flights":
                 if not origin or not destination:
                     continue
-                # Define args BEFORE using it
                 args = {"origin": origin, "destination": destination,
                         "cabin_class": "", "sort_by": "price", "sort_order": "asc"}
-                # Respect the one-way detection so the forced call also
-                # returns recommended return options.
                 if state.get("force_return_recommendation"):
                     args["include_return"] = True
                 result = search_flights.invoke(args)
@@ -1905,6 +2060,12 @@ def coverage_check_node(state: TravelState):
 def route_from_preprocess(state: TravelState):
     if state.get("selection_just_saved"):
         return "selection_ack"
+    # Cancel — canned reply, never hit the LLM
+    if state.get("trip_plan_cancelled"):
+        return "trip_plan_cancelled"
+    # Mid-flow trip plan conversation
+    if state.get("pending_trip_plan"):
+        return "direct_trip_plan"
     if state.get("needs_origin") or state.get("needs_destination"):
         return "ask_missing_info"
     if (state.get("trip_plan_requested")
@@ -1922,7 +2083,6 @@ def route_from_agent(state: TravelState):
 
 def route_from_tools(state: TravelState):
     last = state["messages"][-1]
-    # tools_node emitted a final AIMessage (build_trip_plan path) → done
     if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
         return END
     return "agent"
@@ -1951,6 +2111,7 @@ def route_after_coverage(state: TravelState):
 builder = StateGraph(TravelState)
 builder.add_node("preprocess", preprocess_node)
 builder.add_node("selection_ack", selection_ack_node)
+builder.add_node("trip_plan_cancelled", trip_plan_cancelled_node)
 builder.add_node("ask_missing_info", ask_missing_info_node)
 builder.add_node("direct_trip_plan", direct_trip_plan_node)
 builder.add_node("agent", agent_node)
@@ -1962,11 +2123,13 @@ builder.set_entry_point("preprocess")
 
 builder.add_conditional_edges("preprocess", route_from_preprocess, {
     "selection_ack": "selection_ack",
+    "trip_plan_cancelled": "trip_plan_cancelled",
     "ask_missing_info": "ask_missing_info",
     "direct_trip_plan": "direct_trip_plan",
     "agent": "agent",
 })
 builder.add_edge("selection_ack", END)
+builder.add_edge("trip_plan_cancelled", END)
 builder.add_edge("ask_missing_info", END)
 builder.add_edge("direct_trip_plan", END)
 
@@ -1993,12 +2156,12 @@ app = builder.compile(checkpointer=MemorySaver())
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    BUILD = "v10-full-rebuild"
+    BUILD = "v11-conversational-trip-planner"
     print("=" * 60)
     print(f"  Travel Agent — {BUILD}")
     print(f"  Provider: {PROVIDER}")
     print(f"  Zero-hallucination validator: ON")
-    print(f"  Deterministic trip plans: ON")
+    print(f"  Conversational trip planner: ON")
     print("  Type 'exit' or 'quit' to stop.")
     print("=" * 60)
 
@@ -2032,5 +2195,3 @@ if __name__ == "__main__":
         else:
             print(f"\nAgent: [no reply — try rephrasing]\n")
         print("-" * 60)
-
-
